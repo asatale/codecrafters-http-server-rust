@@ -16,8 +16,11 @@ fn process_get_request(stream: &mut TcpStream, request: HttpRequest) -> std::io:
     response.set_status(&"200 OK");
 
     if request.url.starts_with("/echo/") {
-        response.set_body(request.url.split("/").collect::<Vec<&str>>()[2]);
+        let body = request.url.split("/").collect::<Vec<&str>>()[2];
+        response.set_body(body);
         response.set_header("Content Type", "text/plain");
+        response.set_header("Content Length", &body.to_string());
+
         send_response(stream,&response.to_string().unwrap())?;
     } else {
        send_not_found(stream, request)?;
