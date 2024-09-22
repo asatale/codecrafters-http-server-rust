@@ -45,6 +45,23 @@ fn process_get_request(stream: &mut TcpStream, request: HttpRequest) -> std::io:
     Ok(())
 }
 
+fn process_post_request(stream: &mut TcpStream, request: HttpRequest) -> std::io::Result<()> {
+    let mut response: HttpResponse = HttpResponse::new();
+    response.set_version(&request.version);
+    response.set_status(&"201 Created");
+
+    if request.url.starts_with("/files/") {
+        let filename = request.url.split("/").collect::<Vec<&str>>()[2];
+        let dirname = get_serving_directory();
+        let mut file = std::fs::File::create(format!("{}/{}", dirname, filename))?;
+        file.write_all(request.body.as_bytes())?;
+        send_response(stream,&response.to_string().unwrap())?;
+    } else {
+        send_not_found(stream, request)?;
+    }
+
+    Ok(())
+}
 
 // Send 404 Not Found response to the client
 fn send_not_found(stream: &mut TcpStream, request: HttpRequest)-> std::io::Result<()> {
@@ -72,6 +89,9 @@ fn process_request(stream: &mut TcpStream, request: HttpRequest) -> std::io::Res
     match request.method.as_str() {
         "GET" => {
             process_get_request(stream, request)?;
+        },
+        "POST" => {
+            process_post_request(stream, request)?;
         },
         _ => {
             send_not_allowed(stream, request)?;
