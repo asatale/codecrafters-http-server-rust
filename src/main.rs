@@ -1,7 +1,5 @@
-use std::{io::{Read, Write}, net::{TcpListener, TcpStream}};
+use std::{env, io::{Read, Write}, net::{TcpListener, TcpStream}, thread};
 use http_server_starter_rust::{Request as HttpRequest, Response as HttpResponse};
-use std::thread;
-
 
 // Send response string to the client
 fn send_response(stream: &mut std::net::TcpStream, response: &str) -> std::io::Result<()> {
@@ -24,6 +22,21 @@ fn process_get_request(stream: &mut TcpStream, request: HttpRequest) -> std::io:
         response.set_body(&request.headers.get("User-Agent").unwrap_or(&"".to_string()));
         response.set_header("Content-Type", "text/plain");
         send_response(stream,&response.to_string().unwrap())?;
+    } else if request.url.starts_with("/files"){
+        let filename = request.url.split("/").collect::<Vec<&str>>()[2];
+        let dirname = get_serving_directory();
+
+        let result = std::fs::read_to_string(format!("{}/{}", dirname, filename));
+        match result {
+            Ok(content) => {
+                response.set_body(&content);
+                response.set_header("Content-Type", "application/octet-stream");
+                send_response(stream,&response.to_string().unwrap())?;
+            },
+            Err(_) => {
+                send_not_found(stream, request)?;
+            }
+        }
     } else if request.url == "/" {
         send_response(stream,&response.to_string().unwrap())?;
     } else {
@@ -80,12 +93,17 @@ fn handle_client(stream: &mut TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
+fn get_serving_directory() -> String {
+    let args: Vec<String> = env::args().collect();
+    for arg in args.iter() {
+        if arg == "--directory" {
+            return args.get(args.iter().position(|x| x == "--directory").unwrap() + 1).unwrap().to_string();
+        }
+    }
+    return ".".to_string();
+}
+
 fn main() {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    // println!("Logs from your program will appear here!");
-
-    // Uncomment this block to pass the first stage
-
     let listener = TcpListener::bind("127.0.0.1:4221").expect("Failed to create listener");
     
     for stream in listener.incoming() {
