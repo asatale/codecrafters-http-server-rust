@@ -17,10 +17,12 @@ fn process_get_request(stream: &mut TcpStream, request: HttpRequest) -> std::io:
 
     if request.url.starts_with("/echo/") {
         response.set_body(request.url.split("/").collect::<Vec<&str>>()[2]);
-        response.set_header("Content Type", "text/plain");
+        response.set_header("Content-Type", "text/plain");
+        send_response(stream,&response.to_string().unwrap())?;
+    } else if request.url == "/" {
         send_response(stream,&response.to_string().unwrap())?;
     } else {
-       send_not_found(stream, request)?;
+        send_not_found(stream, request)?;
     }
     Ok(())
 }
