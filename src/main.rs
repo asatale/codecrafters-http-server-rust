@@ -19,6 +19,10 @@ fn process_get_request(stream: &mut TcpStream, request: HttpRequest) -> std::io:
         response.set_body(request.url.split("/").collect::<Vec<&str>>()[2]);
         response.set_header("Content-Type", "text/plain");
         send_response(stream,&response.to_string().unwrap())?;
+    } else if request.url.starts_with("/user-agent") {
+        response.set_body(&request.headers.get("User-Agent").unwrap_or(&"".to_string()));
+        response.set_header("Content-Type", "text/plain");
+        send_response(stream,&response.to_string().unwrap())?;
     } else if request.url == "/" {
         send_response(stream,&response.to_string().unwrap())?;
     } else {
