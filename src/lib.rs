@@ -7,13 +7,12 @@ pub struct Request {
     pub method: String,
     pub url: String,
     pub headers: HashMap<String, String>,
-    pub _body: String,
+    pub body: String,
 }
 
 enum ParseState {
     StartLine,
     Headers,
-    Body,
 }
 
 impl Request {
@@ -23,7 +22,7 @@ impl Request {
             method: String::new(),
             url: String::new(),
             headers: HashMap::new(),
-            _body: String::new(),
+            body: String::new(),
         }
     }
 
@@ -88,17 +87,24 @@ impl Request {
                 },
                 ParseState::Headers => {
                     if line == "\r\n" {
-                        if req.method == "GET" {
-                            break;
-                        }
-                        state = ParseState::Body;
+                        break;
                     } else {
                         let _ = req.parse_header(&line)
                         .or_else(|e| return Err(e));
                     }
                 },
-                ParseState::Body => { break;},
             }
+        }
+        let content_length = req.headers
+                                        .get("Content-Length")
+                                        .unwrap_or(&"0".to_string())
+                                        .parse::<usize>()
+                                        .unwrap();
+
+        for _ in 0..content_length {
+            let mut byte = [0];
+            reader(&mut byte)?;
+            req.body.push(byte[0] as char);
         }
         Ok(req)
     }
@@ -129,7 +135,9 @@ impl Response {
     pub fn set_header(&mut self, name: &str, value: &str) {
         self.headers.insert(name.to_string(), value.to_string());
     }
-
+    pub fn set_body(&mut self, body: &str) {
+        self.body.push_str(body);
+    }
     pub fn to_string(&self) -> std::io::Result<String> {
         let mut msg = String::new();
         msg.push_str(&self.version);
@@ -145,9 +153,10 @@ impl Response {
         }
         msg.push_str("Content-Length: ");
         msg.push_str(&self.body.len().to_string());
-        msg.push_str("\r\n");
-        msg.push_str("\r\n");
-
+        msg.push_str("\r\n\r\n");
+        if self.body.len() > 0 {
+            msg.push_str(&self.body);
+        }
         Ok(msg)
     }
 }
