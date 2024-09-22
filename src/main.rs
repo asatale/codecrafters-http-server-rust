@@ -1,5 +1,6 @@
 use std::{io::{Read, Write}, net::{TcpListener, TcpStream}};
 use http_server_starter_rust::{Request as HttpRequest, Response as HttpResponse};
+use std::thread;
 
 
 // Send response string to the client
@@ -90,9 +91,11 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                handle_client(&mut stream).unwrap_or(());
-                stream.shutdown(std::net::Shutdown::Both)
-                    .unwrap_or_else(|e| println!("error: {} in closing connection", e));
+                thread::spawn(move || {
+                    handle_client(&mut stream).unwrap_or(());
+                    stream.shutdown(std::net::Shutdown::Both)
+                        .unwrap_or_else(|e| println!("error: {} in closing connection", e));
+                });
             }
             Err(e) => {
                 println!("error: {}", e);
