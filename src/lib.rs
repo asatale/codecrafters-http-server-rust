@@ -1,8 +1,10 @@
 
 use std::{collections::HashMap, io::{Write, Read, Error, ErrorKind}};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 
 #[derive(Debug)]
-pub struct Request {
+struct Request {
     pub version: String,
     pub method: String,
     pub url: String,
@@ -16,7 +18,7 @@ enum ParseState {
 }
 
 impl Request {
-    pub fn new() -> Request {
+    fn new() -> Request {
         Request {
             version: String::new(),
             method: String::new(),
@@ -78,7 +80,7 @@ impl Request {
         Ok(())
     }
 
-    pub fn from_stream(mut reader: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> std::io::Result<Self> {
+    fn from_stream(mut reader: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> std::io::Result<Self> {
         let mut state: ParseState = ParseState::StartLine;
         let mut req = Request::new();
 
@@ -114,11 +116,12 @@ impl Request {
     }
 }
 
-pub struct Response {
+struct Response {
     version: String,
     status: String,
     headers: HashMap<String, String>,
     body: String,
+    encoding: String,
 }
 
 impl Response {
@@ -128,18 +131,58 @@ impl Response {
             status: String::new(),
             headers: HashMap::new(),
             body: String::new(),
+            encoding: String::new(),
         }
     }
-    pub fn set_status(&mut self, status: &str) {
+    fn set_status(&mut self, status: &str) {
         self.status.push_str(status);
     }
-    pub fn set_header(&mut self, name: &str, value: &str) {
+    fn set_header(&mut self, name: &str, value: &str) {
         self.headers.insert(name.to_string(), value.to_string());
     }
-    pub fn set_body(&mut self, body: &str) {
+    fn set_body(&mut self, body: &str) {
         self.body.push_str(body);
     }
-    pub fn to_string(&self) -> std::io::Result<String> {
+    fn set_encoding(&mut self, encoding: &str) {
+        self.encoding.push_str(encoding);
+    }
+
+    fn handle_encoding(&mut self, msg: &mut String) -> () {
+        if self.encoding.len() > 0 && self.body.len() > 0 {
+            msg.push_str("Content-Encoding: ");
+            msg.push_str(&self.encoding);
+            msg.push_str("\r\n");
+
+            match self.encoding.as_str() {
+                "gzip" => {
+                    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                    std::io::copy(&mut self.body.as_bytes(), &mut encoder).unwrap();
+                    let output = encoder.finish().unwrap();
+
+                    msg.push_str("Content-Length: ");
+                    msg.push_str(&output.len().to_string());
+                    msg.push_str("\r\n\r\n");
+                    msg.push_str(&output.iter().map(|&c| c as char).collect::<String>());
+                },
+                _ => {
+                    msg.push_str("Content-Length: ");
+                    msg.push_str(&self.body.len().to_string());
+                    msg.push_str("\r\n\r\n");
+                    if self.body.len() > 0 {
+                        msg.push_str(&self.body);
+                    }
+                }
+            }
+        } else {
+            msg.push_str("Content-Length: ");
+            msg.push_str(&self.body.len().to_string());
+            msg.push_str("\r\n\r\n");
+            if self.body.len() > 0 {
+                msg.push_str(&self.body);
+            }
+        }
+    }
+    fn to_string(&mut self) -> std::io::Result<String> {
         let mut msg = String::new();
         msg.push_str(&self.version);
         msg.push_str(" ");
@@ -152,12 +195,7 @@ impl Response {
             msg.push_str(&value);
             msg.push_str("\r\n");
         }
-        msg.push_str("Content-Length: ");
-        msg.push_str(&self.body.len().to_string());
-        msg.push_str("\r\n\r\n");
-        if self.body.len() > 0 {
-            msg.push_str(&self.body);
-        }
+        self.handle_encoding(&mut msg);
         Ok(msg)
     }
 }
@@ -180,6 +218,7 @@ impl Transaction {
 pub struct SessionConfig {
     pub download_dir: String,
     pub upload_dir: String,
+    pub supported_encoding: Vec<String>,
 }
 
 pub struct Session {
@@ -189,7 +228,6 @@ pub struct Session {
 
 impl Session {
     pub fn new(config: SessionConfig, stream: std::net::TcpStream) -> Session {
-        println!("New session from: {}", stream.peer_addr().unwrap());
         Session {
             stream: stream,
             config: config,
@@ -225,12 +263,29 @@ impl Session {
             _ => {
                 transaction.response.set_status(&"405 Method Not Allowed");
                 transaction.response.set_header("Allow", "GET, POST");
-                self.send(&transaction.response.to_string().unwrap())?;}
+                self.send(&transaction.response.to_string().unwrap())?;
+            }
         }
         Ok(())
     }
 
+    fn process_content_encoding(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
+        if transaction.request.headers.contains_key("Accept-Encoding") {
+            println!("{:?}", transaction.request.headers.get("Accept-Encoding").unwrap());
+            let encoder_options = transaction.request.headers.get("Accept-Encoding").unwrap().split(",").collect::<Vec<&str>>();
+            for requested_option in encoder_options {
+                for supported_option in self.config.supported_encoding.iter() {
+                    if requested_option == supported_option {
+                        println!("Selection encoding{:?}", requested_option);
+                        transaction.response.set_encoding(&requested_option);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     fn process_echo_request(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
+        self.process_content_encoding(transaction)?;
         transaction.response.set_status(&"200 OK");
         transaction.response.set_body(transaction.request.url.split("/").collect::<Vec<&str>>()[2]);
         transaction.response.set_header("Content-Type", "text/plain");
@@ -239,6 +294,7 @@ impl Session {
     }
 
     fn process_user_agent_request(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
+        self.process_content_encoding(transaction)?;
         transaction.response.set_status(&"200 OK");
         transaction.response.set_body(&transaction.request.headers.get("User-Agent").unwrap_or(&"".to_string()));
         transaction.response.set_header("Content-Type", "text/plain");
@@ -247,6 +303,7 @@ impl Session {
     }
 
     fn process_file_download_request(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
+        self.process_content_encoding(transaction)?;
         let filename = transaction.request.url.split("/").collect::<Vec<&str>>()[2];
         let dirname = self.config.download_dir.as_str();
         let result = std::fs::read_to_string(format!("{}/{}", dirname, filename));
@@ -274,6 +331,7 @@ impl Session {
         } else if transaction.request.url.starts_with("/files"){
             self.process_file_download_request(transaction)?;
         } else if transaction.request.url == "/" {
+            transaction.response.set_status(&"200 OK");
             self.send(&transaction.response.to_string().unwrap())?;
         } else {
             transaction.response.set_status(&"404 Not Found");
@@ -287,14 +345,13 @@ impl Session {
             let filename = transaction.request.url.split("/").collect::<Vec<&str>>()[2];
             let dirname = self.config.upload_dir.as_str();
             let mut file = std::fs::File::create(format!("{}/{}", dirname, filename)).unwrap();
-
+            transaction.response.set_status(&"201 Created");
             file.write_all(transaction.request.body.as_bytes())?;
             self.send(&transaction.response.to_string().unwrap())?;
         } else {
             transaction.response.set_status(&"404 Not Found");
             self.send(&transaction.response.to_string().unwrap())?;
         }
-
         Ok(())
     }
 }

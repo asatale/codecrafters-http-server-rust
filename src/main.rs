@@ -16,13 +16,16 @@ fn get_serving_directory() -> String {
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:4221").expect("Failed to create listener");
     let dirname = get_serving_directory();
+    let supported_encoding = vec!("gzip".to_string(), "deflate".to_string());
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let mut session = Session::new(SessionConfig{
                                                                     download_dir: dirname.clone(),
-                                                                    upload_dir: dirname.clone(),},
+                                                                    upload_dir: dirname.clone(),
+                                                                    supported_encoding: supported_encoding.clone(),
+                                                                },
                                                         stream);
                 thread::spawn(move || {
                     session.handle_client().unwrap_or(());
