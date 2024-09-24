@@ -271,12 +271,10 @@ impl Session {
 
     fn process_content_encoding(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
         if transaction.request.headers.contains_key("Accept-Encoding") {
-            println!("{:?}", transaction.request.headers.get("Accept-Encoding").unwrap());
             let encoder_options = transaction.request.headers.get("Accept-Encoding").unwrap().split(",").collect::<Vec<&str>>();
             for requested_option in encoder_options {
                 for supported_option in self.config.supported_encoding.iter() {
-                    if requested_option == supported_option {
-                        println!("Selection encoding{:?}", requested_option);
+                    if requested_option.trim() == supported_option.trim() {
                         transaction.response.set_encoding(&requested_option);
                     }
                 }
