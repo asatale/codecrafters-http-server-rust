@@ -2,6 +2,7 @@
 use std::{collections::HashMap, io::{Write, Read, Error, ErrorKind}};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use nom::AsBytes;
 
 #[derive(Debug)]
 struct Request {
@@ -120,7 +121,7 @@ struct Response {
     version: String,
     status: String,
     headers: HashMap<String, String>,
-    body: String,
+    body: Vec<u8>,
     encoding: String,
 }
 
@@ -130,7 +131,7 @@ impl Response {
             version: "HTTP/1.1".to_string(),
             status: String::new(),
             headers: HashMap::new(),
-            body: String::new(),
+            body: Vec::new(),
             encoding: String::new(),
         }
     }
@@ -141,59 +142,39 @@ impl Response {
         self.headers.insert(name.to_string(), value.to_string());
     }
     fn set_body(&mut self, body: &str) {
-        self.body.push_str(body);
+        self.body.extend(body.as_bytes());
     }
     fn set_encoding(&mut self, encoding: &str) {
         self.encoding.push_str(encoding);
     }
 
-    fn handle_encoding(&mut self, msg: &mut String) -> () {
+    fn handle_encoding(&mut self, msg: &mut Vec<u8>) -> () {
         if self.encoding.len() > 0 && self.body.len() > 0 {
-            msg.push_str("Content-Encoding: ");
-            msg.push_str(&self.encoding);
-            msg.push_str("\r\n");
-
+            msg.extend(format!("Content-Encoding: {}\r\n", self.encoding).as_bytes());
             match self.encoding.as_str() {
                 "gzip" => {
                     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                    std::io::copy(&mut self.body.as_bytes(), &mut encoder).unwrap();
+                    std::io::copy(&mut self.body.as_slice(), &mut encoder).unwrap();
                     let output = encoder.finish().unwrap();
-
-                    msg.push_str("Content-Length: ");
-                    msg.push_str(&output.len().to_string());
-                    msg.push_str("\r\n\r\n");
-                    msg.push_str(&output.iter().map(|&c| c as char).collect::<String>());
+                    msg.extend(format!("Content-Length: {}\r\n\r\n", output.len()).as_bytes());
+                    msg.extend(output.iter());
                 },
                 _ => {
-                    msg.push_str("Content-Length: ");
-                    msg.push_str(&self.body.len().to_string());
-                    msg.push_str("\r\n\r\n");
-                    if self.body.len() > 0 {
-                        msg.push_str(&self.body);
-                    }
+                    msg.extend(format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes());
+                    msg.extend(self.body.as_bytes());
                 }
             }
         } else {
-            msg.push_str("Content-Length: ");
-            msg.push_str(&self.body.len().to_string());
-            msg.push_str("\r\n\r\n");
-            if self.body.len() > 0 {
-                msg.push_str(&self.body);
-            }
+            msg.extend(format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes());
+            msg.extend(self.body.as_bytes());
         }
     }
-    fn to_string(&mut self) -> std::io::Result<String> {
-        let mut msg = String::new();
-        msg.push_str(&self.version);
-        msg.push_str(" ");
-        msg.push_str(&self.status);
-        msg.push_str("\r\n");
+    fn to_string(&mut self) -> std::io::Result<Vec<u8>> {
+        let mut msg: Vec<u8> = Vec::new();
+        msg.extend(format!("{} {}\r\n", self.version, self.status).as_bytes());
 
         for (key,value) in self.headers.iter() {
-            msg.push_str(&key);
-            msg.push_str(": ");
-            msg.push_str(&value);
-            msg.push_str("\r\n");
+            msg.extend(format!("{}: {}\r\n",key, value).as_bytes());
         }
         self.handle_encoding(&mut msg);
         Ok(msg)
@@ -239,8 +220,8 @@ impl Session {
         Ok(())
     }
 
-    fn send(&mut self, response: &str) -> std::io::Result<()> {
-        self.stream.write(response.as_bytes())?;
+    fn send(&mut self, response: Vec<u8>) -> std::io::Result<()> {
+        self.stream.write(&response)?;
         self.stream.flush()?;
         Ok(())
     }
@@ -263,7 +244,7 @@ impl Session {
             _ => {
                 transaction.response.set_status(&"405 Method Not Allowed");
                 transaction.response.set_header("Allow", "GET, POST");
-                self.send(&transaction.response.to_string().unwrap())?;
+                self.send(transaction.response.to_string().unwrap())?;
             }
         }
         Ok(())
@@ -275,7 +256,9 @@ impl Session {
             for requested_option in encoder_options {
                 for supported_option in self.config.supported_encoding.iter() {
                     if requested_option.trim() == supported_option.trim() {
-                        transaction.response.set_encoding(&requested_option);
+                        println!("Setting encoding to {:?}", requested_option);
+                        transaction.response.set_encoding(&requested_option.trim());
+                        break;
                     }
                 }
             }
@@ -283,11 +266,12 @@ impl Session {
         Ok(())
     }
     fn process_echo_request(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
+        println!("{:?}", transaction.request.url);
         self.process_content_encoding(transaction)?;
         transaction.response.set_status(&"200 OK");
         transaction.response.set_body(transaction.request.url.split("/").collect::<Vec<&str>>()[2]);
         transaction.response.set_header("Content-Type", "text/plain");
-        self.send(&transaction.response.to_string().unwrap())?;
+        self.send(transaction.response.to_string().unwrap())?;
         Ok(())
     }
 
@@ -296,7 +280,7 @@ impl Session {
         transaction.response.set_status(&"200 OK");
         transaction.response.set_body(&transaction.request.headers.get("User-Agent").unwrap_or(&"".to_string()));
         transaction.response.set_header("Content-Type", "text/plain");
-        self.send(&transaction.response.to_string().unwrap())?;
+        self.send(transaction.response.to_string().unwrap())?;
         Ok(())
     }
 
@@ -310,11 +294,11 @@ impl Session {
                 transaction.response.set_status(&"200 OK");
                 transaction.response.set_body(&content);
                 transaction.response.set_header("Content-Type", "application/octet-stream");
-                self.send(&transaction.response.to_string().unwrap())?;
+                self.send(transaction.response.to_string().unwrap())?;
             },
             Err(_) => {
                 transaction.response.set_status(&"404 Not Found");
-                self.send(&transaction.response.to_string().unwrap())?;
+                self.send(transaction.response.to_string().unwrap())?;
             }
         }
         Ok(())
@@ -330,10 +314,10 @@ impl Session {
             self.process_file_download_request(transaction)?;
         } else if transaction.request.url == "/" {
             transaction.response.set_status(&"200 OK");
-            self.send(&transaction.response.to_string().unwrap())?;
+            self.send(transaction.response.to_string().unwrap())?;
         } else {
             transaction.response.set_status(&"404 Not Found");
-            self.send(&transaction.response.to_string().unwrap())?;
+            self.send(transaction.response.to_string().unwrap())?;
         }
         Ok(())
     }
@@ -345,10 +329,10 @@ impl Session {
             let mut file = std::fs::File::create(format!("{}/{}", dirname, filename)).unwrap();
             transaction.response.set_status(&"201 Created");
             file.write_all(transaction.request.body.as_bytes())?;
-            self.send(&transaction.response.to_string().unwrap())?;
+            self.send(transaction.response.to_string().unwrap())?;
         } else {
             transaction.response.set_status(&"404 Not Found");
-            self.send(&transaction.response.to_string().unwrap())?;
+            self.send(transaction.response.to_string().unwrap())?;
         }
         Ok(())
     }
