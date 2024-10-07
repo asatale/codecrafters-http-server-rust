@@ -1,339 +1,429 @@
 
-use std::{collections::HashMap, io::{Write, Read, Error, ErrorKind}};
-use flate2::write::GzEncoder;
-use flate2::Compression;
-use nom::AsBytes;
+use std::{collections::HashMap, io::{Error, ErrorKind, Read, Write}, str::SplitWhitespace};
+//use flate2::write::GzEncoder;
+//use flate2::Compression;
 
 #[derive(Debug)]
-struct Request {
-    pub version: String,
-    pub method: String,
-    pub url: String,
-    pub headers: HashMap<String, String>,
-    pub body: String,
+pub struct HeaderMap {
+    pub map: HashMap<String, Vec<String>>,
 }
-
-enum ParseState {
-    StartLine,
-    Headers,
-}
-
-impl Request {
-    fn new() -> Request {
-        Request {
-            version: String::new(),
-            method: String::new(),
-            url: String::new(),
-            headers: HashMap::new(),
-            body: String::new(),
+impl HeaderMap {
+    pub fn new() -> HeaderMap {
+        HeaderMap {
+            map: HashMap::new(),
         }
     }
+}
 
-    fn readline(mut reader: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> std::io::Result<String>{
-        let mut buf = Vec::new();
-        let mut possible_end = false;
-        loop {
-            let mut byte = [0];
-            reader(&mut byte)?;
-            buf.push(byte[0]);
-            match byte[0] {
-                b'\n' if possible_end => break,
-                b'\r' => possible_end = true,
-                _ => possible_end = false,
+pub enum HttpError {
+    Io(std::io::Error),
+    ParseError(&'static str),
+}
+
+#[derive(Debug, Clone)]
+pub enum Method {
+    GET,
+    POST,
+    PUT,
+    DELETE,
+    HEAD,
+    OPTIONS,
+    CONNECT,
+    TRACE,
+}
+impl Method {
+    pub fn from_string(method: &str) -> Result<Method, HttpError> {
+        match method{
+            "GET" => Ok(Method::GET),
+            "POST" => Ok(Method::POST),
+            "PUT" => Ok(Method::PUT),
+            "DELETE" => Ok(Method::DELETE),
+            "HEAD" => Ok(Method::HEAD),
+            "OPTIONS" => Ok(Method::OPTIONS),
+            "CONNECT" => Ok(Method::CONNECT),
+            "TRACE" => Ok(Method::TRACE),
+            _ => Err(HttpError::ParseError("Invalid HTTP method")),
+        }
+    }
+    pub fn to_string(method: &Method) -> String {
+        let str = match method {
+            Method::GET => "GET",
+            Method::POST => "POST",
+            Method::PUT => "PUT",
+            Method::DELETE => "DELETE",
+            Method::HEAD => "HEAD",
+            Method::OPTIONS => "OPTIONS",
+            Method::CONNECT => "CONNECT",
+            Method::TRACE => "TRACE",
+        };
+        str.to_string()
+    }
+}
+
+#[derive(Debug)]
+pub enum Version {
+    Http1_0,
+    Http1_1,
+    Http2_0,
+    Http3_0,
+}
+
+impl Version {
+    pub fn from_str(version: &str) -> Result<Version, HttpError> {
+        match version {
+            "HTTP/1.0" => Ok(Version::Http1_0),
+            "HTTP/1.1" => Ok(Version::Http1_1),
+            "HTTP/2.0" => Ok(Version::Http2_0),
+            "HTTP/3.0" => Ok(Version::Http3_0),
+            _ => Err(HttpError::ParseError("Invalid HTTP version")),
+        }
+    }
+    pub fn to_str(version: Version) -> String {
+        let str = match version {
+            Version::Http1_0 => "HTTP/1.0",
+            Version::Http1_1 => "HTTP/1.1",
+            Version::Http2_0 => "HTTP/2.0",
+            Version::Http3_0 => "HTTP/3.0",
+        };
+        str.to_string()
+    }
+}
+type StatusCode = (u16, String);
+
+//Inspirations: https://tokio.rs/tokio/tutorial/framing
+#[derive(Debug)]
+pub enum HttpFrame {
+    RequestHead {
+        method: Method,
+        uri: String,
+        version: Version,
+        headers: HeaderMap,
+    },
+    ResponseHead {
+        status: StatusCode,
+        version: Version,
+        headers: HeaderMap,
+    },
+    BodyChunk {
+        chunk: Vec<u8>,
+    },
+}
+
+impl HttpFrame {
+    pub fn get_uri(&self) -> Result<String, Error> {
+        match self {
+            HttpFrame::RequestHead { uri, .. } => Ok(uri.clone()),
+            _ => Err(Error::new(ErrorKind::InvalidData, "Invalid frame type")),
+        }
+    }
+    fn line_from_stream<'a>(data: &mut impl Iterator<Item = &'a u8>) -> Result<Vec<u8>, HttpError> {
+        let mut line: Vec<u8> = Vec::new();
+        let mut found_carriage_return = false;
+
+        for byte in data {
+            line.push(*byte);
+            match byte {
+                b'\n' if found_carriage_return => break,
+                b'\r' => found_carriage_return = true,
+                _ => (),
             }
         }
-        let s = String::from_utf8(buf).unwrap();
-        Ok(s)
+        if found_carriage_return && line.last() == Some(&&b'\n') {
+            return Ok(line);
+        }
+        Err(HttpError::ParseError("Error parsing line"))
     }
 
-    fn parse_request_line(&mut self, line: &str) -> std::io::Result<()> {
+    fn process_request_line(mut tokens: SplitWhitespace) -> Result<(String, Version), HttpError> {
+
+        let str: &str = match tokens.next() {
+            Some(str) => str,
+            None => return Err(HttpError::ParseError("Error in parsing request line - No uri found")),
+        };
+        let uri = str.to_string();
+
+        let str: &str = match tokens.next() {
+            Some(str) => str,
+            None => return Err(HttpError::ParseError("Error in parsing request line - No version found"))
+        };
+        let version = Version::from_str(str)?;
+        Ok((uri, version))
+    }
+
+    fn process_status_line(mut tokens: SplitWhitespace) -> Result<StatusCode, HttpError> {
+        let str: &str = match tokens.next() {
+            Some(str) => str,
+            None => return Err(HttpError::ParseError("Error in parsing request line - status code found")),
+        };
+        let status = str.parse::<u16>().unwrap();
+        let reason = tokens.collect::<String>();
+        Ok((status, reason))
+    }
+
+    fn process_msg_headers<'a>(data: & mut impl Iterator<Item = &'a u8>) -> Result<HeaderMap, HttpError> {
+        let mut headers = HeaderMap::new();
+        loop {
+            let line = HttpFrame::line_from_stream(data)?;
+            if line == b"\r\n" {
+                break;
+            }
+            let mut parts = std::str::from_utf8(&line).unwrap().splitn(2, ':');
+
+            let key = parts.next().unwrap().trim().to_string();
+            let values = parts
+                                        .next()
+                                        .unwrap()
+                                        .trim()
+                                        .to_string()
+                                        .split(",")
+                                        .map(|s| s.trim().to_string())
+                                        .collect::<Vec<String>>();
+            headers.map.insert(key, values);
+        }
+        Ok(headers)
+    }
+
+    fn message_frame_from_stream<'a>(data: &mut impl Iterator<Item = &'a u8>) -> Result<HttpFrame, HttpError> {
+        let line = String::from_utf8(HttpFrame::line_from_stream(data)?).unwrap();
         let mut tokens =  line.split_whitespace();
 
         let str: &str = match tokens.next() {
             Some(str) => str,
-            None => return Err(Error::new(ErrorKind::InvalidInput, "Invalid input")),
+            None => return Err(HttpError::ParseError("Error in parsing request line - No method found")),
         };
-        self.method = str.to_string();
-
-        let str: &str = match tokens.next() {
-            Some(str) => str,
-            None => return Err(Error::new(ErrorKind::InvalidInput, "Invalid input")),
-        };
-        self.url = str.to_string();
-
-        let str: &str = match tokens.next() {
-            Some(str) => str,
-            None => return Err(Error::new(ErrorKind::InvalidInput, "Invalid input")),
-        };
-        self.version = str.to_string();
-        Ok(())
-    }
-
-    fn parse_header(&mut self, line: &str) -> std::io::Result<()> {
-        let mut parts = line.splitn(2, ':');
-        let key = parts.next().unwrap().trim().to_string();
-        let mut value = parts.next().unwrap().trim().to_string();
-
-        if self.headers.contains_key(&key) {
-            value = format!("{},{}", self.headers.get(&key).unwrap(), value).to_string();
-        }
-        self.headers.insert(key, value);
-        Ok(())
-    }
-
-    fn from_stream(mut reader: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> std::io::Result<Self> {
-        let mut state: ParseState = ParseState::StartLine;
-        let mut req = Request::new();
-
-        while let Ok(line) = Request::readline(&mut reader) {
-            match state {
-                ParseState::StartLine => {
-                    let _ = req.parse_request_line(&line)
-                    .or_else(|e| return Err(e));
-                    state = ParseState::Headers;
-                },
-                ParseState::Headers => {
-                    if line == "\r\n" {
-                        break;
-                    } else {
-                        let _ = req.parse_header(&line)
-                        .or_else(|e| return Err(e));
-                    }
-                },
-            }
-        }
-        let content_length = req.headers
-                                        .get("Content-Length")
-                                        .unwrap_or(&"0".to_string())
-                                        .parse::<usize>()
-                                        .unwrap();
-
-        for _ in 0..content_length {
-            let mut byte = [0];
-            reader(&mut byte)?;
-            req.body.push(byte[0] as char);
-        }
-        Ok(req)
-    }
-}
-
-struct Response {
-    version: String,
-    status: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-    encoding: String,
-}
-
-impl Response {
-    pub fn new() -> Response {
-        Response {
-            version: "HTTP/1.1".to_string(),
-            status: String::new(),
-            headers: HashMap::new(),
-            body: Vec::new(),
-            encoding: String::new(),
-        }
-    }
-    fn set_status(&mut self, status: &str) {
-        self.status.push_str(status);
-    }
-    fn set_header(&mut self, name: &str, value: &str) {
-        self.headers.insert(name.to_string(), value.to_string());
-    }
-    fn set_body(&mut self, body: &str) {
-        self.body.extend(body.as_bytes());
-    }
-    fn set_encoding(&mut self, encoding: &str) {
-        self.encoding.push_str(encoding);
-    }
-
-    fn handle_encoding(&mut self, msg: &mut Vec<u8>) -> () {
-        if self.encoding.len() > 0 && self.body.len() > 0 {
-            msg.extend(format!("Content-Encoding: {}\r\n", self.encoding).as_bytes());
-            match self.encoding.as_str() {
-                "gzip" => {
-                    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                    std::io::copy(&mut self.body.as_slice(), &mut encoder).unwrap();
-                    let output = encoder.finish().unwrap();
-                    msg.extend(format!("Content-Length: {}\r\n\r\n", output.len()).as_bytes());
-                    msg.extend(output.iter());
-                },
-                _ => {
-                    msg.extend(format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes());
-                    msg.extend(self.body.as_bytes());
-                }
-            }
-        } else {
-            msg.extend(format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes());
-            msg.extend(self.body.as_bytes());
-        }
-    }
-    fn to_string(&mut self) -> std::io::Result<Vec<u8>> {
-        let mut msg: Vec<u8> = Vec::new();
-        msg.extend(format!("{} {}\r\n", self.version, self.status).as_bytes());
-
-        for (key,value) in self.headers.iter() {
-            msg.extend(format!("{}: {}\r\n",key, value).as_bytes());
-        }
-        self.handle_encoding(&mut msg);
-        Ok(msg)
-    }
-}
-
-
-struct Transaction {
-    request: Request,
-    response: Response,
-}
-
-impl Transaction {
-    pub fn new(request: Request, response: Response) -> Transaction {
-        Transaction {
-            request: request,
-            response: response,
-        }
-    }
-}
-
-pub struct SessionConfig {
-    pub download_dir: String,
-    pub upload_dir: String,
-    pub supported_encoding: Vec<String>,
-}
-
-pub struct Session {
-    stream: std::net::TcpStream,
-    config: SessionConfig,
-}
-
-impl Session {
-    pub fn new(config: SessionConfig, stream: std::net::TcpStream) -> Session {
-        Session {
-            stream: stream,
-            config: config,
-        }
-    }
-
-    pub fn close(&mut self) -> std::io::Result<()> {
-        self.stream.shutdown(std::net::Shutdown::Both)?;
-        Ok(())
-    }
-
-    fn send(&mut self, response: Vec<u8>) -> std::io::Result<()> {
-        self.stream.write(&response)?;
-        self.stream.flush()?;
-        Ok(())
-    }
-
-    fn receive(&mut self) -> std::io::Result<Request> {
-        Request::from_stream(|buf| self.stream.read(buf))
-    }
-
-    pub fn handle_client(&mut self) -> std::io::Result<()> {
-        let request = self.receive()?;
-        let mut transaction = Transaction::new(request, Response::new());
-
-        match transaction.request.method.as_str() {
-            "GET" => {
-                self.process_get_request(&mut transaction)?;
+        match str {
+            "GET" | "POST | PUT" | "DELETE" | "HEAD" | "OPTIONS" | "CONNECT" | "TRACE" => {
+                let (uri, version) = HttpFrame::process_request_line(tokens)?;
+                return Ok(HttpFrame::RequestHead {
+                    method: Method::from_string(str)?,
+                    uri: uri,
+                    version: version,
+                    headers: HttpFrame::process_msg_headers(data)?,
+                });
             },
-            "POST" => {
-                self.process_post_request(&mut transaction)?;
+            "HTTP/1.0" | "HTTP/1.1" | "HTTP/2.0" | "HTTP/3.0" => {
+                let version = Version::from_str(str)?;
+                let status = HttpFrame::process_status_line(tokens)?;
+                return Ok(HttpFrame::ResponseHead {
+                    version: version,
+                    status: (status.0, status.1),
+                    headers: HttpFrame::process_msg_headers(data)?,
+                });
+            },
+            _ => return Err(HttpError::ParseError("Invalid HTTP method")),
+        }
+    }
+
+    fn frame_to_stream(message: HttpFrame) -> Result<Vec<u8>, HttpError> {
+        let mut data = Vec::new();
+        match message {
+            HttpFrame::RequestHead { method, uri, version, headers } => {
+                data.extend(format!("{} {} {}\r\n",
+                                            Method::to_string(&method),
+                                            uri,
+                                            Version::to_str(version)
+                                        ).as_bytes());
+                for (key, values) in headers.map.iter() {
+                    data.extend(format!("{}: {}\r\n", key, values.join(", ")).as_bytes());
+                }
+                data.extend(b"\r\n");
+            },
+            HttpFrame::ResponseHead { version, status, headers } => {
+                data.extend(format!("{} {} {}\r\n", Version::to_str(version), status.0, status.1).as_bytes());
+                for (key, values) in headers.map.iter() {
+                    data.extend(format!("{}: {}\r\n", key, values.join(", ")).as_bytes());
+                }
+                data.extend(b"\r\n");
+            },
+            HttpFrame::BodyChunk { chunk } => {
+                data.extend(chunk);
+            },
+        }
+        Ok(data)
+    }
+
+    pub fn body_frame_from_stream<'a>(length: u32, mut data: impl Iterator<Item = &'a u8>) -> Result<HttpFrame, HttpError> {
+        let mut body = HttpFrame::BodyChunk { chunk: Vec::new() };
+
+        let chunk = match body {
+            HttpFrame::BodyChunk{ref mut chunk} => chunk,
+            _ => unreachable!(),
+        };
+
+        for _ in 1..length {
+            let r = data.next();
+            match r {
+                Some(byte) => {
+                    chunk.push(*byte);
+                },
+                None => return Err(HttpError::ParseError("Error reading body")),
+            }
+        }
+        Ok(body)
+    }
+
+    pub fn from_stream<'a>(data: & mut impl Iterator<Item = &'a u8>) -> Result<Vec<HttpFrame>, HttpError> {
+        let mut frames: Vec<HttpFrame> = Vec::new();
+        let frame = HttpFrame::message_frame_from_stream(data)?;
+
+        let content_length:u32 = match frame {
+            HttpFrame::RequestHead { ref headers, .. } => {
+                headers.map.get("Content-Length").unwrap_or(&vec![0.to_string()])[0].parse::<u32>().unwrap()
+            },
+            HttpFrame::ResponseHead { ref headers, .. } => {
+                headers.map.get("Content-Length").unwrap_or(&vec![0.to_string()])[0].parse::<u32>().unwrap()
+            },
+            _ => 0,
+        };
+
+        frames.push(frame);
+
+        if content_length > 0 {
+            let body = HttpFrame::body_frame_from_stream(content_length, data)?;
+            frames.push(body);
+        }
+        Ok(frames)
+    }
+
+    pub fn to_stream(mut frames: Vec<HttpFrame>) -> Result<Vec<u8>, HttpError> {
+       let mut data: Vec<u8>;
+
+        if frames.len() > 1 {
+            let chunk = match frames.pop().unwrap() {
+                HttpFrame::BodyChunk { chunk } => chunk,
+                _ => unreachable!(),
+            };
+            //Update the content length in the headers
+            let mut message = frames.pop().unwrap();
+
+            let headers = match message {
+                HttpFrame::RequestHead { ref mut headers, .. } =>  headers,
+                HttpFrame::ResponseHead { ref mut headers, .. } => headers,
+                _ => unreachable!(),
+            };
+            headers.map.insert("Content-Length".to_string(), vec![chunk.len().to_string()]);
+            data = HttpFrame::frame_to_stream(frames.pop().unwrap())?;
+            data.extend(chunk);
+        } else {
+            data = HttpFrame::frame_to_stream(frames.pop().unwrap())?;
+        }
+        Ok(data)
+    }
+
+}
+
+struct Route {
+    method: Method,
+    uri: String,
+    handler: Box<dyn Fn(Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError>>,
+}
+
+struct RouteConfig {
+    config: Vec<Route>,
+}
+
+struct ServerConfig {
+    listen_address: String,
+    listen_port: i32,
+}
+
+pub struct HttpServer {
+    config: ServerConfig,
+    routes: RouteConfig
+}
+
+impl HttpServer {
+    pub fn new(listen_address: &str, listen_port: i32) -> HttpServer {
+        HttpServer {
+            config : ServerConfig {
+                listen_address: listen_address.to_string(),
+                listen_port: listen_port,
+            },
+            routes: RouteConfig {
+                config: Vec::new(),
+            },
+        }
+    }
+    pub fn add_route<F>(&mut self, method: Method, uri: String, handler: F)  -> &mut Self
+        where F: Fn(Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> + 'static
+    {
+
+        match method {
+            Method::GET => {
+                self.routes.config.push(Route{method: Method::GET, uri: uri, handler: Box::new(handler)});
+            },
+            Method::POST => {
+                self.routes.config.push(Route{method: Method::POST, uri: uri, handler: Box::new(handler)});
             },
             _ => {
-                transaction.response.set_status(&"405 Method Not Allowed");
-                transaction.response.set_header("Allow", "GET, POST");
-                self.send(transaction.response.to_string().unwrap())?;
+                unimplemented!();
             }
         }
-        Ok(())
+        self
     }
 
-    fn process_content_encoding(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
-        if transaction.request.headers.contains_key("Accept-Encoding") {
-            let encoder_options = transaction.request.headers.get("Accept-Encoding").unwrap().split(",").collect::<Vec<&str>>();
-            for requested_option in encoder_options {
-                for supported_option in self.config.supported_encoding.iter() {
-                    if requested_option.trim() == supported_option.trim() {
-                        println!("Setting encoding to {:?}", requested_option);
-                        transaction.response.set_encoding(&requested_option.trim());
-                        break;
-                    }
+    pub fn listen(&mut self) -> Result<(), HttpError> {
+
+        let listen_addr = format!("{}:{}", self.config.listen_address, self.config.listen_port);
+
+        let listener = match std::net::TcpListener::bind(listen_addr) {
+            Ok(listener) => listener,
+            Err(e) => {
+                return Err(HttpError::Io(e));
+            }
+        };
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+
+                    std::thread::spawn(move || {
+                        HttpServer::handle_client(stream);
+                    });
+                },
+                Err(e) => {
+                    println!("error: {}", e);
                 }
             }
         }
         Ok(())
     }
-    fn process_echo_request(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
-        println!("{:?}", transaction.request.url);
-        self.process_content_encoding(transaction)?;
-        transaction.response.set_status(&"200 OK");
-        transaction.response.set_body(transaction.request.url.split("/").collect::<Vec<&str>>()[2]);
-        transaction.response.set_header("Content-Type", "text/plain");
-        self.send(transaction.response.to_string().unwrap())?;
-        Ok(())
-    }
+    fn handle_client(mut stream: std::net::TcpStream) -> () {
+        let mut frame: Vec<u8> = Vec::new();
 
-    fn process_user_agent_request(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
-        self.process_content_encoding(transaction)?;
-        transaction.response.set_status(&"200 OK");
-        transaction.response.set_body(&transaction.request.headers.get("User-Agent").unwrap_or(&"".to_string()));
-        transaction.response.set_header("Content-Type", "text/plain");
-        self.send(transaction.response.to_string().unwrap())?;
-        Ok(())
-    }
-
-    fn process_file_download_request(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
-        self.process_content_encoding(transaction)?;
-        let filename = transaction.request.url.split("/").collect::<Vec<&str>>()[2];
-        let dirname = self.config.download_dir.as_str();
-        let result = std::fs::read_to_string(format!("{}/{}", dirname, filename));
-        match result {
-            Ok(content) => {
-                transaction.response.set_status(&"200 OK");
-                transaction.response.set_body(&content);
-                transaction.response.set_header("Content-Type", "application/octet-stream");
-                self.send(transaction.response.to_string().unwrap())?;
-            },
-            Err(_) => {
-                transaction.response.set_status(&"404 Not Found");
-                self.send(transaction.response.to_string().unwrap())?;
+        stream.set_read_timeout(Some(std::time::Duration::from_millis(10))).unwrap();
+        loop {
+            let mut buf: Vec<u8> = Vec::with_capacity(1024);
+            let count = stream.read(&mut buf).unwrap();
+            if count == 0 {
+                break;
             }
+            frame.extend(buf);
         }
-        Ok(())
-    }
-
-    fn process_get_request(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
-
-        if transaction.request.url.starts_with("/echo/") {
-            self.process_echo_request(transaction)?;
-        } else if transaction.request.url.starts_with("/user-agent") {
-            self.process_user_agent_request(transaction)?;
-        } else if transaction.request.url.starts_with("/files"){
-            self.process_file_download_request(transaction)?;
-        } else if transaction.request.url == "/" {
-            transaction.response.set_status(&"200 OK");
-            self.send(transaction.response.to_string().unwrap())?;
-        } else {
-            transaction.response.set_status(&"404 Not Found");
-            self.send(transaction.response.to_string().unwrap())?;
-        }
-        Ok(())
-    }
-
-    fn process_post_request(&mut self, transaction: &mut Transaction) -> std::io::Result<()> {
-        if transaction.request.url.starts_with("/files/") {
-            let filename = transaction.request.url.split("/").collect::<Vec<&str>>()[2];
-            let dirname = self.config.upload_dir.as_str();
-            let mut file = std::fs::File::create(format!("{}/{}", dirname, filename)).unwrap();
-            transaction.response.set_status(&"201 Created");
-            file.write_all(transaction.request.body.as_bytes())?;
-            self.send(transaction.response.to_string().unwrap())?;
-        } else {
-            transaction.response.set_status(&"404 Not Found");
-            self.send(transaction.response.to_string().unwrap())?;
-        }
-        Ok(())
+        let frames = match HttpFrame::from_stream(&mut frame.iter()) {
+            Ok(frames) => frames,
+            Err(_e) => {
+                println!("Error parsing frame");
+                stream.write(b"HTTP/1.1 400 Bad Request\r\n\r\n").unwrap();
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
+                return;
+            }
+        };
+        let (uri, method) = match frames[0] {
+            HttpFrame::RequestHead { ref uri, ref method, .. } => (uri, method),
+            _ => {
+                stream.write(b"HTTP/1.1 400 Bad Request\r\n\r\n").unwrap();
+                stream.shutdown(std::net::Shutdown::Both).unwrap();
+                return;
+            },
+        };
+        println!("URI: {}, method: {}", uri, Method::to_string(method));
+        stream.write(b"HTTP/1.1 400 Bad Request\r\n\r\n").unwrap();
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+        return;
     }
 }
+
+
+
+
