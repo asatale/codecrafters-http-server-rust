@@ -1,5 +1,5 @@
 
-use std::{collections::HashMap, io::{Error, ErrorKind, Read, Write}, str::SplitWhitespace};
+use std::{collections::HashMap, io::{Error, ErrorKind, Read, Write}, str::SplitWhitespace, sync::Arc};
 //use flate2::write::GzEncoder;
 //use flate2::Compression;
 
@@ -309,17 +309,32 @@ impl HttpFrame {
         }
         Ok(data)
     }
-
 }
 
 struct Route {
     method: Method,
     uri: String,
-    handler: Box<dyn Fn(Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError>>,
+    handler: Arc<Box<dyn Fn(Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> + 'static + Send + Sync>>,
 }
 
 struct RouteConfig {
     config: Vec<Route>,
+}
+
+impl Clone for RouteConfig {
+    fn clone(&self) -> RouteConfig {
+        let mut config: Vec<Route> = Vec::new();
+        for route in self.config.iter() {
+            config.push(Route {
+                method: route.method.clone(),
+                uri: route.uri.clone(),
+                handler: route.handler.clone(),
+            });
+        }
+        RouteConfig {
+            config: config,
+        }
+    }
 }
 
 struct ServerConfig {
@@ -344,22 +359,21 @@ impl HttpServer {
             },
         }
     }
-    pub fn add_route<F>(&mut self, method: Method, uri: String, handler: F)  -> &mut Self
-        where F: Fn(Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> + 'static
+    pub fn add_route<F>(&mut self, method: Method, uri: String, handler: F)  -> ()
+        where F: Fn(Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> + 'static + Send + Sync
     {
 
         match method {
             Method::GET => {
-                self.routes.config.push(Route{method: Method::GET, uri: uri, handler: Box::new(handler)});
+                self.routes.config.push(Route{method: Method::GET, uri: uri, handler: Arc::new(Box::new(handler))});
             },
             Method::POST => {
-                self.routes.config.push(Route{method: Method::POST, uri: uri, handler: Box::new(handler)});
+                self.routes.config.push(Route{method: Method::POST, uri: uri, handler: Arc::new(Box::new(handler))});
             },
             _ => {
                 unimplemented!();
             }
         }
-        self
     }
 
     pub fn listen(&mut self) -> Result<(), HttpError> {
@@ -369,6 +383,7 @@ impl HttpServer {
         let listener = match std::net::TcpListener::bind(listen_addr) {
             Ok(listener) => listener,
             Err(e) => {
+                println!("Error binding to address: {}", e);
                 return Err(HttpError::Io(e));
             }
         };
@@ -376,9 +391,9 @@ impl HttpServer {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-
-                    std::thread::spawn(move || {
-                        HttpServer::handle_client(stream);
+                    let config = self.routes.clone();
+                    std::thread::spawn( || {
+                        HttpServer::handle_client(stream, config);
                     });
                 },
                 Err(e) => {
@@ -388,18 +403,28 @@ impl HttpServer {
         }
         Ok(())
     }
-    fn handle_client(mut stream: std::net::TcpStream) -> () {
-        let mut frame: Vec<u8> = Vec::new();
 
+    fn handle_client(mut stream: std::net::TcpStream, _config: RouteConfig) -> () {
+        let mut frame: Vec<u8> = Vec::new();
         stream.set_read_timeout(Some(std::time::Duration::from_millis(10))).unwrap();
         loop {
-            let mut buf: Vec<u8> = Vec::with_capacity(1024);
-            let count = stream.read(&mut buf).unwrap();
-            if count == 0 {
-                break;
+            let mut buf: [u8;1024] = [0;1024];
+            match stream.read(&mut buf) {
+                Ok(count) => {
+                    frame.extend_from_slice(&buf[0..count]);
+                },
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::WouldBlock && frame.len() > 0 {
+                        break;
+                    } else {
+                        println!("Error reading from stream: {}", e);
+                        stream.shutdown(std::net::Shutdown::Both).unwrap();
+                        return;
+                    }
+                }
             }
-            frame.extend(buf);
         }
+        println!("Received frame: {:?}", frame);
         let frames = match HttpFrame::from_stream(&mut frame.iter()) {
             Ok(frames) => frames,
             Err(_e) => {
