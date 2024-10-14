@@ -1,9 +1,86 @@
 
-use std::{collections::HashMap, io::{Error, ErrorKind, Read, Write}, str::SplitWhitespace, sync::Arc};
-//use flate2::write::GzEncoder;
-//use flate2::Compression;
+use std::{collections::HashMap, io::{Read, Write}, str::SplitWhitespace, sync::Arc};
+use std::result::Result::Ok;
+use std::fmt;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use flate2::write::DeflateEncoder;
 
-#[derive(Debug)]
+struct DataStream {
+    active: bool,
+    stream: std::net::TcpStream,
+    data: [u8; 1024],
+    rptr: usize,
+    wptr: usize,
+}
+
+impl DataStream  {
+    pub fn new(stream: std::net::TcpStream) -> DataStream {
+        DataStream {
+            active: true,
+            stream: stream,
+            data: [0; 1024],
+            rptr: 0,
+            wptr: 0,
+        }
+    }
+    pub fn close(&mut self) -> () {
+        self.active = false;
+        self.stream.shutdown(std::net::Shutdown::Both).unwrap();
+    }
+
+    fn consume_byte(&mut self) -> u8 {
+        let byte = self.data[self.rptr];
+        self.rptr += 1;
+        byte
+    }
+    pub fn write(&mut self, data: &[u8]) -> Result<usize, HttpError> {
+        match self.stream.write(data) {
+            Ok(count) => Ok(count),
+            Err(error) => {
+                println!("Error writing to stream: {}", error);
+                Err(HttpError::new(HttpErrorKind::IOError, "I/O Error", None))
+            },
+        }
+    }
+    fn next(&mut self) -> Option<u8> {
+        if self.active == false {
+            println!("Stream is closed");
+            return None;
+        }
+        if self.rptr < self.wptr {
+            return Some(self.consume_byte());
+        } else {
+            self.rptr = 0;
+            self.wptr = 0;
+        }
+
+        match self.stream.read(&mut self.data) {
+            Ok(count) => {
+                self.wptr = count;
+                if count == 0 {
+                    return None;
+                }
+                return Some(self.consume_byte());
+            }
+            Err(_) => {
+                println!("Error reading from socket");
+                return None;
+            }
+        }
+    }
+}
+
+impl Iterator for DataStream {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        self.next()
+    }
+}
+
+
+#[derive(Debug, Clone)]
 pub struct HeaderMap {
     pub map: HashMap<String, Vec<String>>,
 }
@@ -15,12 +92,40 @@ impl HeaderMap {
     }
 }
 
-pub enum HttpError {
-    Io(std::io::Error),
-    ParseError(&'static str),
+
+#[derive(Debug, Clone)]
+pub enum HttpErrorKind {
+    RequestError,
+    ResponseError,
+    ParseError,
+    IOError,
 }
 
 #[derive(Debug, Clone)]
+pub struct HttpError {
+    kind: HttpErrorKind,
+    err_msg: String,
+    err_code: u32,
+}
+
+impl HttpError {
+    pub fn new(kind: HttpErrorKind, msg: &str, code: Option<u32>) -> HttpError {
+        HttpError {
+            kind: kind,
+            err_msg: msg.to_string(),
+            err_code: code.unwrap_or(0),
+        }
+    }
+}
+impl fmt::Display for HttpError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "HttpError: {}", self.err_msg)
+    }
+}
+
+
+
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub enum Method {
     GET,
     POST,
@@ -42,7 +147,7 @@ impl Method {
             "OPTIONS" => Ok(Method::OPTIONS),
             "CONNECT" => Ok(Method::CONNECT),
             "TRACE" => Ok(Method::TRACE),
-            _ => Err(HttpError::ParseError("Invalid HTTP method")),
+            _ => Err(HttpError::new(HttpErrorKind::RequestError,"Bad Request", Some(400))),
         }
     }
     pub fn to_string(method: &Method) -> String {
@@ -60,7 +165,7 @@ impl Method {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Version {
     Http1_0,
     Http1_1,
@@ -75,7 +180,7 @@ impl Version {
             "HTTP/1.1" => Ok(Version::Http1_1),
             "HTTP/2.0" => Ok(Version::Http2_0),
             "HTTP/3.0" => Ok(Version::Http3_0),
-            _ => Err(HttpError::ParseError("Invalid HTTP version")),
+            _ => Err(HttpError::new(HttpErrorKind::ParseError, "Error parsing version", None)),
         }
     }
     pub fn to_str(version: Version) -> String {
@@ -91,7 +196,7 @@ impl Version {
 type StatusCode = (u16, String);
 
 //Inspirations: https://tokio.rs/tokio/tutorial/framing
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum HttpFrame {
     RequestHead {
         method: Method,
@@ -110,18 +215,24 @@ pub enum HttpFrame {
 }
 
 impl HttpFrame {
-    pub fn get_uri(&self) -> Result<String, Error> {
+    pub fn get_uri(&self) -> String {
         match self {
-            HttpFrame::RequestHead { uri, .. } => Ok(uri.clone()),
-            _ => Err(Error::new(ErrorKind::InvalidData, "Invalid frame type")),
+            HttpFrame::RequestHead { uri, .. } => uri.clone(),
+            _ => {panic!("No uri found for frame")},
         }
     }
-    fn line_from_stream<'a>(data: &mut impl Iterator<Item = &'a u8>) -> Result<Vec<u8>, HttpError> {
+    pub fn get_method(&self) -> Method {
+        match self {
+            HttpFrame::RequestHead { method, .. } => method.clone(),
+            _ => panic!("No method found for frame"),
+        }
+    }
+    fn line_from_stream(data: &mut impl Iterator<Item = u8>) -> Result<Vec<u8>, HttpError> {
         let mut line: Vec<u8> = Vec::new();
         let mut found_carriage_return = false;
 
         for byte in data {
-            line.push(*byte);
+            line.push(byte);
             match byte {
                 b'\n' if found_carriage_return => break,
                 b'\r' => found_carriage_return = true,
@@ -131,20 +242,26 @@ impl HttpFrame {
         if found_carriage_return && line.last() == Some(&&b'\n') {
             return Ok(line);
         }
-        Err(HttpError::ParseError("Error parsing line"))
+        println!("Error in parsing request line - No CRLF found");
+        Err(HttpError::new(HttpErrorKind::ParseError, "Error parsing message", None))
     }
 
     fn process_request_line(mut tokens: SplitWhitespace) -> Result<(String, Version), HttpError> {
-
         let str: &str = match tokens.next() {
             Some(str) => str,
-            None => return Err(HttpError::ParseError("Error in parsing request line - No uri found")),
+            None => {
+                println!("Error in parsing request line - No URI found");
+                return Err(HttpError::new(HttpErrorKind::RequestError, "Bad Request", Some(400)));
+            }
         };
         let uri = str.to_string();
 
         let str: &str = match tokens.next() {
             Some(str) => str,
-            None => return Err(HttpError::ParseError("Error in parsing request line - No version found"))
+            None => {
+                println!("Error in parsing request line - No version found");
+                return Err(HttpError::new(HttpErrorKind::RequestError, "Bad Request", Some(400)));
+            }
         };
         let version = Version::from_str(str)?;
         Ok((uri, version))
@@ -153,14 +270,17 @@ impl HttpFrame {
     fn process_status_line(mut tokens: SplitWhitespace) -> Result<StatusCode, HttpError> {
         let str: &str = match tokens.next() {
             Some(str) => str,
-            None => return Err(HttpError::ParseError("Error in parsing request line - status code found")),
+            None => {
+                println!("Error in parsing response line - No status found");
+                return Err(HttpError::new(HttpErrorKind::ResponseError, "Parse Error", None));
+            }
         };
         let status = str.parse::<u16>().unwrap();
         let reason = tokens.collect::<String>();
         Ok((status, reason))
     }
 
-    fn process_msg_headers<'a>(data: & mut impl Iterator<Item = &'a u8>) -> Result<HeaderMap, HttpError> {
+    fn process_msg_headers(data: & mut impl Iterator<Item = u8>) -> Result<HeaderMap, HttpError> {
         let mut headers = HeaderMap::new();
         loop {
             let line = HttpFrame::line_from_stream(data)?;
@@ -183,13 +303,16 @@ impl HttpFrame {
         Ok(headers)
     }
 
-    fn message_frame_from_stream<'a>(data: &mut impl Iterator<Item = &'a u8>) -> Result<HttpFrame, HttpError> {
+    fn message_frame_from_stream(data: &mut impl Iterator<Item = u8>) -> Result<HttpFrame, HttpError> {
         let line = String::from_utf8(HttpFrame::line_from_stream(data)?).unwrap();
         let mut tokens =  line.split_whitespace();
 
         let str: &str = match tokens.next() {
             Some(str) => str,
-            None => return Err(HttpError::ParseError("Error in parsing request line - No method found")),
+            None => {
+                println!("Error in parsing request line - No method found");
+                return Err(HttpError::new(HttpErrorKind::ParseError, "Bad Request", None));
+            },
         };
         match str {
             "GET" | "POST | PUT" | "DELETE" | "HEAD" | "OPTIONS" | "CONNECT" | "TRACE" => {
@@ -210,7 +333,7 @@ impl HttpFrame {
                     headers: HttpFrame::process_msg_headers(data)?,
                 });
             },
-            _ => return Err(HttpError::ParseError("Invalid HTTP method")),
+            _ => return Err(HttpError::new(HttpErrorKind::ParseError,"Bad Request", None)),
         }
     }
 
@@ -230,6 +353,7 @@ impl HttpFrame {
             },
             HttpFrame::ResponseHead { version, status, headers } => {
                 data.extend(format!("{} {} {}\r\n", Version::to_str(version), status.0, status.1).as_bytes());
+
                 for (key, values) in headers.map.iter() {
                     data.extend(format!("{}: {}\r\n", key, values.join(", ")).as_bytes());
                 }
@@ -242,7 +366,7 @@ impl HttpFrame {
         Ok(data)
     }
 
-    pub fn body_frame_from_stream<'a>(length: u32, mut data: impl Iterator<Item = &'a u8>) -> Result<HttpFrame, HttpError> {
+    pub fn body_frame_from_stream(length: u32, mut data: impl Iterator<Item = u8>) -> Result<HttpFrame, HttpError> {
         let mut body = HttpFrame::BodyChunk { chunk: Vec::new() };
 
         let chunk = match body {
@@ -254,15 +378,15 @@ impl HttpFrame {
             let r = data.next();
             match r {
                 Some(byte) => {
-                    chunk.push(*byte);
+                    chunk.push(byte);
                 },
-                None => return Err(HttpError::ParseError("Error reading body")),
+                None => return Err(HttpError::new(HttpErrorKind::RequestError, "Bad Request", Some(400))),
             }
         }
         Ok(body)
     }
 
-    pub fn from_stream<'a>(data: & mut impl Iterator<Item = &'a u8>) -> Result<Vec<HttpFrame>, HttpError> {
+    pub fn from_stream(data: &mut impl Iterator<Item = u8>) -> Result<Vec<HttpFrame>, HttpError> {
         let mut frames: Vec<HttpFrame> = Vec::new();
         let frame = HttpFrame::message_frame_from_stream(data)?;
 
@@ -289,7 +413,7 @@ impl HttpFrame {
        let mut data: Vec<u8>;
 
         if frames.len() > 1 {
-            let chunk = match frames.pop().unwrap() {
+            let mut chunk = match frames.pop().unwrap() {
                 HttpFrame::BodyChunk { chunk } => chunk,
                 _ => unreachable!(),
             };
@@ -301,8 +425,20 @@ impl HttpFrame {
                 HttpFrame::ResponseHead { ref mut headers, .. } => headers,
                 _ => unreachable!(),
             };
+            if headers.map.contains_key("Content-Encoding") {
+                let encoding = headers.map.get("Content-Encoding").unwrap().get(0).unwrap();
+                if encoding == "gzip" {
+                    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                    encoder.write_all(&chunk).unwrap();
+                    chunk = encoder.finish().unwrap();
+                } else if encoding == "deflate" {
+                    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+                    encoder.write_all(&chunk).unwrap();
+                    chunk = encoder.finish().unwrap();
+                }
+            }
             headers.map.insert("Content-Length".to_string(), vec![chunk.len().to_string()]);
-            data = HttpFrame::frame_to_stream(frames.pop().unwrap())?;
+            data = HttpFrame::frame_to_stream(message)?;
             data.extend(chunk);
         } else {
             data = HttpFrame::frame_to_stream(frames.pop().unwrap())?;
@@ -362,7 +498,6 @@ impl HttpServer {
     pub fn add_route<F>(&mut self, method: Method, uri: String, handler: F)  -> ()
         where F: Fn(Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> + 'static + Send + Sync
     {
-
         match method {
             Method::GET => {
                 self.routes.config.push(Route{method: Method::GET, uri: uri, handler: Arc::new(Box::new(handler))});
@@ -374,6 +509,8 @@ impl HttpServer {
                 unimplemented!();
             }
         }
+        // Sort the resultant vector by uri length
+        self.routes.config.sort_by(|a, b| b.uri.len().cmp(&a.uri.len()));
     }
 
     pub fn listen(&mut self) -> Result<(), HttpError> {
@@ -384,7 +521,7 @@ impl HttpServer {
             Ok(listener) => listener,
             Err(e) => {
                 println!("Error binding to address: {}", e);
-                return Err(HttpError::Io(e));
+                return Err(HttpError::new(HttpErrorKind::IOError, "I/O Error", None));
             }
         };
 
@@ -392,7 +529,7 @@ impl HttpServer {
             match stream {
                 Ok(stream) => {
                     let config = self.routes.clone();
-                    std::thread::spawn( || {
+                    std::thread::spawn( move || {
                         HttpServer::handle_client(stream, config);
                     });
                 },
@@ -404,48 +541,96 @@ impl HttpServer {
         Ok(())
     }
 
-    fn handle_client(mut stream: std::net::TcpStream, _config: RouteConfig) -> () {
-        let mut frame: Vec<u8> = Vec::new();
-        stream.set_read_timeout(Some(std::time::Duration::from_millis(10))).unwrap();
-        loop {
-            let mut buf: [u8;1024] = [0;1024];
-            match stream.read(&mut buf) {
-                Ok(count) => {
-                    frame.extend_from_slice(&buf[0..count]);
-                },
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock && frame.len() > 0 {
-                        break;
-                    } else {
-                        println!("Error reading from stream: {}", e);
-                        stream.shutdown(std::net::Shutdown::Both).unwrap();
-                        return;
+    fn handle_client(stream: std::net::TcpStream, route_cfg: RouteConfig) -> () {
+        let mut data_stream = DataStream::new(stream);
+
+        let frame_buf = match HttpFrame::from_stream(&mut data_stream) {
+            Ok(frame_buf) => frame_buf,
+            Err(e) => {
+                match e.kind {
+                    HttpErrorKind::RequestError => {
+                        data_stream.write(format!("HTTP/1.1 {} {}\r\n\r\n", e.err_code, e.err_msg).as_bytes()).unwrap();
+                    },
+                    _ => {
+                        println!("Error reading from stream: {}", e.err_msg);
                     }
+                }
+                data_stream.close();
+                return;
+            }
+        };
+        println!("Received frames: {:?}", frame_buf);
+        match HttpServer::handle_transaction(&mut data_stream, route_cfg, frame_buf){
+            Ok(_) => (),
+            Err(e) => {
+                match e.kind {
+                    HttpErrorKind::RequestError => {
+                        data_stream.write(format!("HTTP/1.1 {} {}\r\n\r\n", e.err_code, e.err_msg).as_bytes()).unwrap();
+                    },
+                    _ => {
+                        println!("Internal Server Error: {}", e.err_msg);
+                        data_stream.write(b"HTTP/1.1 500 Internal Server Error \r\n\r\n").unwrap();
+                    }
+                }
+                data_stream.close();
+                ()
+            }
+        };
+    }
+
+    fn process_compression_headers(request: &HttpFrame) -> Result<String, HttpError> {
+        let request_hdrs = match request {
+            HttpFrame::RequestHead { headers, .. } => headers,
+            _ => unreachable!(),
+        };
+        if request_hdrs.map.contains_key("Accept-Encoding") {
+            println!("Compression headers found");
+            let requested_algos = request_hdrs.map.get("Accept-Encoding").unwrap();
+            for encoding in requested_algos.iter() {
+                println!("Encoding: {}", encoding);
+                if encoding == "gzip" || encoding == "deflate" {
+                    println!("Found matching encryption {}", encoding);
+                    return Ok(encoding.clone())
                 }
             }
         }
-        println!("Received frame: {:?}", frame);
-        let frames = match HttpFrame::from_stream(&mut frame.iter()) {
-            Ok(frames) => frames,
-            Err(_e) => {
-                println!("Error parsing frame");
-                stream.write(b"HTTP/1.1 400 Bad Request\r\n\r\n").unwrap();
-                stream.shutdown(std::net::Shutdown::Both).unwrap();
-                return;
+        Err(HttpError::new(HttpErrorKind::RequestError, "No matching compression algorithm", None))
+    }
+
+    fn handle_transaction(data_stream: &mut DataStream, route_cfg: RouteConfig, frames: Vec<HttpFrame>) -> Result<(), HttpError> {
+
+        let request = frames[0].clone();
+        let (msg_method, msg_uri) = (request.get_method(), request.get_uri());
+
+        for route in route_cfg.config.iter(){
+            if route.method == msg_method && msg_uri.starts_with(route.uri.as_str()) {
+                let handler = route.handler.clone();
+                match handler(frames) {
+                    Ok(mut response) => {
+                       match HttpServer::process_compression_headers(&request) {
+                            Ok(encoding) => {
+                                let header = match response[0] {
+                                    HttpFrame::ResponseHead { ref mut headers, .. } => headers,
+                                    _ => unreachable!(),
+                                };
+                                header.map.insert("Content-Encoding".to_string(), vec![encoding]);
+                            },
+                            _ => (),
+                        };
+                        let data = HttpFrame::to_stream(response).unwrap();
+                        data_stream.write(&data).unwrap();
+                    },
+                    Err(e) => {
+                        println!("Error processing request: {:?}", e);
+                        data_stream.write(b"HTTP/1.1 500 Internal Server Error\r\n\r\n").unwrap();
+                    }
+                }
+                return Ok(());
             }
-        };
-        let (uri, method) = match frames[0] {
-            HttpFrame::RequestHead { ref uri, ref method, .. } => (uri, method),
-            _ => {
-                stream.write(b"HTTP/1.1 400 Bad Request\r\n\r\n").unwrap();
-                stream.shutdown(std::net::Shutdown::Both).unwrap();
-                return;
-            },
-        };
-        println!("URI: {}, method: {}", uri, Method::to_string(method));
-        stream.write(b"HTTP/1.1 400 Bad Request\r\n\r\n").unwrap();
-        stream.shutdown(std::net::Shutdown::Both).unwrap();
-        return;
+        }
+        data_stream.write(b"HTTP/1.1 400 Bad Request\r\n\r\n").unwrap();
+        data_stream.close();
+        return Ok(());
     }
 }
 

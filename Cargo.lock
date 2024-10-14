@@ -75,12 +75,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
-name = "crate"
-version = "0.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e01b009894d9f9a4aa007d4bd6af93c8970c68ff2a8ea9bd2a7258c21aa38f1"
-
-[[package]]
 name = "crc32fast"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -129,7 +123,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
- "crate",
  "flate2",
  "itertools",
  "nom",

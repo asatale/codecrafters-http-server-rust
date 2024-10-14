@@ -14,6 +14,7 @@ fn get_serving_directory() -> String {
 }
 
 fn handle_default_path(_request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
+    println!("Handling default path");
     let response = HttpFrame::ResponseHead {
         status: (200,"OK".to_string()),
         version: Version::Http1_1,
@@ -27,6 +28,7 @@ fn handle_default_path(_request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpEr
 }
 
 fn handle_user_agent(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
+    println!("Handling user-agent");
     let response = HttpFrame::ResponseHead {
         status: (200,"OK".to_string()),
         version: Version::Http1_1,
@@ -40,21 +42,21 @@ fn handle_user_agent(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError
         HttpFrame::RequestHead { headers, .. } => headers,
         _ => panic!("Invalid request type"),
     };
-    let user_agent = match headers.map.get("User-Agent").unwrap().get(0) {
-        Some(user_agent) => user_agent,
-        None => &"".to_string(),
+    match headers.map.get("User-Agent").unwrap().get(0) {
+        Some(user_agent) => {
+            let response_body = HttpFrame::BodyChunk {
+                chunk: Vec::<u8>::from(user_agent.as_bytes()),
+            };
+            return Ok(vec![response, response_body]);
+        },
+        None => (),
     };
-    if user_agent.len() > 0 {
-        let response_body = HttpFrame::BodyChunk {
-            chunk: Vec::<u8>::from(user_agent.as_bytes()),
-        };
-        return Ok(vec![response, response_body]);
-    }
     Ok(vec![response])
 
 }
 
 fn handle_echo(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
+    println!("Handling echo");
     let response = HttpFrame::ResponseHead{
         status: (200,"OK".to_string()),
         version: Version::Http1_1,
@@ -64,7 +66,7 @@ fn handle_echo(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
                             ])
                         },
     };
-    let result = request.get(0).unwrap().get_uri().unwrap();
+    let result = request.get(0).unwrap().get_uri();
     let (prefix, remaining) = result.split_at("/echo/".len());
     assert_eq!(prefix, "/echo/");
 
@@ -73,8 +75,9 @@ fn handle_echo(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
 }
 
 fn handle_files(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
+    println!("Handling files");
     let dirname = get_serving_directory();
-    let result = request.get(0).unwrap().get_uri().unwrap();
+    let result = request.get(0).unwrap().get_uri();
     let (prefix, filename) = result.split_at("/files/".len());
     assert_eq!(prefix, "/files/");
 
@@ -113,8 +116,8 @@ fn main() {
 
     server.add_route(Method::GET, "/".to_string(), &handle_default_path);
     server.add_route(Method::GET, "/user-agent".to_string(),&handle_user_agent);
-    server.add_route(Method::GET, "/echo/*".to_string(), &handle_echo);
-    server.add_route(Method::GET, "/files/*".to_string(), &handle_files);
+    server.add_route(Method::GET, "/echo/".to_string(), &handle_echo);
+    server.add_route(Method::GET, "/files/".to_string(), &handle_files);
 
     match server.listen() {
         Ok(_) => println!("Server started at http://{}", listen_addr),
