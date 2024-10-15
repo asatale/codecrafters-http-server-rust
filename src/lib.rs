@@ -314,8 +314,9 @@ impl HttpFrame {
                 return Err(HttpError::new(HttpErrorKind::ParseError, "Bad Request", None));
             },
         };
+
         match str {
-            "GET" | "POST | PUT" | "DELETE" | "HEAD" | "OPTIONS" | "CONNECT" | "TRACE" => {
+            "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "CONNECT" | "TRACE" => {
                 let (uri, version) = HttpFrame::process_request_line(tokens)?;
                 return Ok(HttpFrame::RequestHead {
                     method: Method::from_string(str)?,
@@ -374,7 +375,7 @@ impl HttpFrame {
             _ => unreachable!(),
         };
 
-        for _ in 1..length {
+        for _ in 0..length {
             let r = data.next();
             match r {
                 Some(byte) => {
@@ -389,7 +390,6 @@ impl HttpFrame {
     pub fn from_stream(data: &mut impl Iterator<Item = u8>) -> Result<Vec<HttpFrame>, HttpError> {
         let mut frames: Vec<HttpFrame> = Vec::new();
         let frame = HttpFrame::message_frame_from_stream(data)?;
-
         let content_length:u32 = match frame {
             HttpFrame::RequestHead { ref headers, .. } => {
                 headers.map.get("Content-Length").unwrap_or(&vec![0.to_string()])[0].parse::<u32>().unwrap()
@@ -598,7 +598,6 @@ impl HttpServer {
     }
 
     fn handle_transaction(data_stream: &mut DataStream, route_cfg: RouteConfig, frames: Vec<HttpFrame>) -> Result<(), HttpError> {
-
         let request = frames[0].clone();
         let (msg_method, msg_uri) = (request.get_method(), request.get_uri());
 

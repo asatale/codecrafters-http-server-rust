@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env};
+use std::{collections::HashMap, env, fs::OpenOptions, io::Write};
 use http_server_starter_rust::{ HeaderMap, HttpError, HttpFrame, HttpServer, Method, Version };
 
 
@@ -13,18 +13,28 @@ fn get_serving_directory() -> String {
     return ".".to_string();
 }
 
-fn handle_default_path(_request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
+fn handle_default_path(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
     println!("Handling default path");
-    let response = HttpFrame::ResponseHead {
-        status: (200,"OK".to_string()),
-        version: Version::Http1_1,
-        headers: HeaderMap{
-            map: HashMap::from([
-                                ("Content-Type".to_string(), vec!["text/html".to_string()]),
-                            ])
-                        },
-    };
-    Ok(vec![response])
+    let uri = request.get(0).unwrap().get_uri();
+    if uri == "/" {
+        let response = HttpFrame::ResponseHead {
+            status: (200,"OK".to_string()),
+            version: Version::Http1_1,
+            headers: HeaderMap{
+                map: HashMap::new(),
+            },
+        };
+        Ok(vec![response])
+    } else {
+        let response = HttpFrame::ResponseHead {
+            status: (404,"Not Found".to_string()),
+            version: Version::Http1_1,
+            headers: HeaderMap{
+                map: HashMap::new(),
+            },
+        };
+        Ok(vec![response])
+    }
 }
 
 fn handle_user_agent(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
@@ -34,7 +44,7 @@ fn handle_user_agent(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError
         version: Version::Http1_1,
         headers: HeaderMap{
             map: HashMap::from([
-                                ("Content-Type".to_string(), vec!["text/html".to_string()]),
+                                ("Content-Type".to_string(), vec!["text/plain".to_string()]),
                             ])
                         },
     };
@@ -62,7 +72,7 @@ fn handle_echo(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
         version: Version::Http1_1,
         headers: HeaderMap{
             map: HashMap::from([
-                                ("Content-Type".to_string(), vec!["text/html".to_string()]),
+                                ("Content-Type".to_string(), vec!["text/plain".to_string()]),
                             ])
                         },
     };
@@ -74,8 +84,8 @@ fn handle_echo(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
     Ok(vec![response, response_body])
 }
 
-fn handle_files(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
-    println!("Handling files");
+fn handle_files_reads(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
+    println!("Handling files reads");
     let dirname = get_serving_directory();
     let result = request.get(0).unwrap().get_uri();
     let (prefix, filename) = result.split_at("/files/".len());
@@ -88,7 +98,7 @@ fn handle_files(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
             version: Version::Http1_1,
             headers: HeaderMap{
                 map: HashMap::from([
-                                    ("Content-Type".to_string(), vec!["text/html".to_string()]),
+                                    ("Content-Type".to_string(), vec!["application/octet-stream".to_string()]),
                                 ])
                             },
         };
@@ -108,6 +118,49 @@ fn handle_files(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
     })
 }
 
+
+fn handle_files_writes(request:Vec<HttpFrame>) -> Result<Vec<HttpFrame>, HttpError> {
+    println!("Handling files writes");
+    let dirname = get_serving_directory();
+    let result = request.get(0).unwrap().get_uri();
+    let (prefix, filename) = result.split_at("/files/".len());
+    assert_eq!(prefix, "/files/");
+
+    let chunk = match request.get(1).unwrap() {
+        HttpFrame::BodyChunk { chunk } => chunk,
+        _ => panic!("Invalid request type"),
+    };
+
+    let mut file = OpenOptions::new().write(true).truncate(true).create(true).open(format!("{}/{}",dirname,filename)).unwrap();
+
+    match file.write(&chunk) {
+        Ok(_) => {
+            let response = HttpFrame::ResponseHead {
+                status: (201,"Created".to_string()),
+                version: Version::Http1_1,
+                headers: HeaderMap{
+                    map: HashMap::new(),
+                }
+            };
+            file.sync_all().unwrap();
+            Ok(vec![response])
+        },
+        Err(e) => {
+            println!("Error {}, Writing file: {}", e, format!("{}/{}",dirname,filename));
+            let response = HttpFrame::ResponseHead {
+                status: (500,"Internal Server Error".to_string()),
+                version: Version::Http1_1,
+                headers: HeaderMap{
+                    map: HashMap::new()
+                }
+            };
+            file.sync_all().unwrap();
+            Ok(vec![response])
+        },
+    }
+}
+
+
 fn main() {
     let listen_addr = "127.0.0.1";
     let listen_port = 4221;
@@ -117,7 +170,8 @@ fn main() {
     server.add_route(Method::GET, "/".to_string(), &handle_default_path);
     server.add_route(Method::GET, "/user-agent".to_string(),&handle_user_agent);
     server.add_route(Method::GET, "/echo/".to_string(), &handle_echo);
-    server.add_route(Method::GET, "/files/".to_string(), &handle_files);
+    server.add_route(Method::GET, "/files/".to_string(), &handle_files_reads);
+    server.add_route(Method::POST, "/files/".to_string(), &handle_files_writes);
 
     match server.listen() {
         Ok(_) => println!("Server started at http://{}", listen_addr),
